@@ -2,25 +2,11 @@ provider "aws" {
   region = local.region
 }
 
-provider "helm" {
-  kubernetes {
-    host                   = module.eks.cluster_endpoint
-    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-
-    exec {
-      api_version = "client.authentication.k8s.io/v1beta1"
-      command     = "aws"
-      # This requires the awscli to be installed locally where Terraform is executed
-      args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
-    }
-  }
-}
-
 data "aws_availability_zones" "available" {}
 
 locals {
   name            = "ex-${replace(basename(path.cwd), "_", "-")}"
-  cluster_version = "1.24"
+  cluster_version = "1.27"
   region          = "eu-west-1"
 
   vpc_cidr = "10.0.0.0/16"
@@ -47,6 +33,11 @@ module "eks" {
   cluster_addons = {
     kube-proxy = {}
     vpc-cni    = {}
+    coredns = {
+      configuration_values = jsonencode({
+        computeType = "Fargate"
+      })
+    }
   }
 
   vpc_id                   = module.vpc.vpc_id
@@ -63,169 +54,50 @@ module "eks" {
     }
   }
 
-  fargate_profiles = {
-    example = {
-      name = "example"
-      selectors = [
-        {
-          namespace = "backend"
-          labels = {
-            Application = "backend"
+  fargate_profiles = merge(
+    {
+      example = {
+        name = "example"
+        selectors = [
+          {
+            namespace = "backend"
+            labels = {
+              Application = "backend"
+            }
+          },
+          {
+            namespace = "app-*"
+            labels = {
+              Application = "app-wildcard"
+            }
           }
-        },
-        {
-          namespace = "app-*"
-          labels = {
-            Application = "app-wildcard"
-          }
+        ]
+
+        # Using specific subnets instead of the subnets supplied for the cluster itself
+        subnet_ids = [module.vpc.private_subnets[1]]
+
+        tags = {
+          Owner = "secondary"
         }
-      ]
 
-      # Using specific subnets instead of the subnets supplied for the cluster itself
-      subnet_ids = [module.vpc.private_subnets[1]]
-
-      tags = {
-        Owner = "secondary"
+        timeouts = {
+          create = "20m"
+          delete = "20m"
+        }
       }
-
-      timeouts = {
-        create = "20m"
-        delete = "20m"
+    },
+    { for i in range(3) :
+      "kube-system-${element(split("-", local.azs[i]), 2)}" => {
+        selectors = [
+          { namespace = "kube-system" }
+        ]
+        # We want to create a profile per AZ for high availability
+        subnet_ids = [element(module.vpc.private_subnets, i)]
       }
     }
-
-    kube_system = {
-      name = "kube-system"
-      selectors = [
-        { namespace = "kube-system" }
-      ]
-    }
-  }
+  )
 
   tags = local.tags
-}
-
-################################################################################
-# Modify EKS CoreDNS Deployment
-################################################################################
-
-data "aws_eks_cluster_auth" "this" {
-  name = module.eks.cluster_name
-}
-
-locals {
-  kubeconfig = yamlencode({
-    apiVersion      = "v1"
-    kind            = "Config"
-    current-context = "terraform"
-    clusters = [{
-      name = module.eks.cluster_name
-      cluster = {
-        certificate-authority-data = module.eks.cluster_certificate_authority_data
-        server                     = module.eks.cluster_endpoint
-      }
-    }]
-    contexts = [{
-      name = "terraform"
-      context = {
-        cluster = module.eks.cluster_name
-        user    = "terraform"
-      }
-    }]
-    users = [{
-      name = "terraform"
-      user = {
-        token = data.aws_eks_cluster_auth.this.token
-      }
-    }]
-  })
-}
-
-# Separate resource so that this is only ever executed once
-resource "null_resource" "remove_default_coredns_deployment" {
-  triggers = {}
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    environment = {
-      KUBECONFIG = base64encode(local.kubeconfig)
-    }
-
-    # We are removing the deployment provided by the EKS service and replacing it through the self-managed CoreDNS Helm addon
-    # However, we are maintaining the existing kube-dns service and annotating it for Helm to assume control
-    command = <<-EOT
-      kubectl --namespace kube-system delete deployment coredns --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-    EOT
-  }
-}
-
-resource "null_resource" "modify_kube_dns" {
-  triggers = {}
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    environment = {
-      KUBECONFIG = base64encode(local.kubeconfig)
-    }
-
-    # We are maintaining the existing kube-dns service and annotating it for Helm to assume control
-    command = <<-EOT
-      echo "Setting implicit dependency on ${module.eks.fargate_profiles["kube_system"].fargate_profile_pod_execution_role_arn}"
-      kubectl --namespace kube-system annotate --overwrite service kube-dns meta.helm.sh/release-name=coredns --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-      kubectl --namespace kube-system annotate --overwrite service kube-dns meta.helm.sh/release-namespace=kube-system --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-      kubectl --namespace kube-system label --overwrite service kube-dns app.kubernetes.io/managed-by=Helm --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-    EOT
-  }
-
-  depends_on = [
-    null_resource.remove_default_coredns_deployment
-  ]
-}
-
-################################################################################
-# CoreDNS Helm Chart (self-managed)
-################################################################################
-
-data "aws_eks_addon_version" "this" {
-  for_each = toset(["coredns"])
-
-  addon_name         = each.value
-  kubernetes_version = module.eks.cluster_version
-  most_recent        = true
-}
-
-resource "helm_release" "coredns" {
-  name             = "coredns"
-  namespace        = "kube-system"
-  create_namespace = false
-  description      = "CoreDNS is a DNS server that chains plugins and provides Kubernetes DNS Services"
-  chart            = "coredns"
-  version          = "1.19.4"
-  repository       = "https://coredns.github.io/helm"
-
-  # For EKS image repositories https://docs.aws.amazon.com/eks/latest/userguide/add-ons-images.html
-  values = [
-    <<-EOT
-      image:
-        repository: 602401143452.dkr.ecr.eu-west-1.amazonaws.com/eks/coredns
-        tag: ${data.aws_eks_addon_version.this["coredns"].version}
-      deployment:
-        name: coredns
-        annotations:
-          eks.amazonaws.com/compute-type: fargate
-      service:
-        name: kube-dns
-        annotations:
-          eks.amazonaws.com/compute-type: fargate
-      podAnnotations:
-        eks.amazonaws.com/compute-type: fargate
-      EOT
-  ]
-
-  depends_on = [
-    # Need to ensure the CoreDNS updates are performed before provisioning
-    null_resource.modify_kube_dns
-  ]
 }
 
 ################################################################################
@@ -234,7 +106,7 @@ resource "helm_release" "coredns" {
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 3.0"
+  version = "~> 4.0"
 
   name = local.name
   cidr = local.vpc_cidr
@@ -244,13 +116,8 @@ module "vpc" {
   public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 48)]
   intra_subnets   = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 52)]
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true
-  enable_dns_hostnames = true
-
-  enable_flow_log                      = true
-  create_flow_log_cloudwatch_iam_role  = true
-  create_flow_log_cloudwatch_log_group = true
+  enable_nat_gateway = true
+  single_nat_gateway = true
 
   public_subnet_tags = {
     "kubernetes.io/role/elb" = 1

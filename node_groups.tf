@@ -19,6 +19,25 @@ locals {
   }
 }
 
+# This sleep resource is used to provide a timed gap between the cluster creation and the downstream dependencies
+# that consume the outputs from here. Any of the values that are used as triggers can be used in dependencies
+# to ensure that the downstream resources are created after both the cluster is ready and the sleep time has passed.
+# This was primarily added to give addons that need to be configured BEFORE data plane compute resources
+# enough time to create and configure themselves before the data plane compute resources are created.
+resource "time_sleep" "this" {
+  count = var.create ? 1 : 0
+
+  create_duration = var.dataplane_wait_duration
+
+  triggers = {
+    cluster_name     = aws_eks_cluster.this[0].name
+    cluster_endpoint = aws_eks_cluster.this[0].endpoint
+    cluster_version  = aws_eks_cluster.this[0].version
+
+    cluster_certificate_authority_data = aws_eks_cluster.this[0].certificate_authority[0].data
+  }
+}
+
 ################################################################################
 # EKS IPV6 CNI Policy
 # TODO - hopefully AWS releases a managed policy which can replace this
@@ -115,6 +134,25 @@ locals {
       type        = "ingress"
       self        = true
     }
+    # metrics-server
+    ingress_cluster_4443_webhook = {
+      description                   = "Cluster API to node 4443/tcp webhook"
+      protocol                      = "tcp"
+      from_port                     = 4443
+      to_port                       = 4443
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
+    # prometheus-adapter
+    ingress_cluster_6443_webhook = {
+      description                   = "Cluster API to node 6443/tcp webhook"
+      protocol                      = "tcp"
+      from_port                     = 6443
+      to_port                       = 6443
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
+    # Karpenter
     ingress_cluster_8443_webhook = {
       description                   = "Cluster API to node 8443/tcp webhook"
       protocol                      = "tcp"
@@ -123,6 +161,7 @@ locals {
       type                          = "ingress"
       source_cluster_security_group = true
     }
+    # ALB controller, NGINX
     ingress_cluster_9443_webhook = {
       description                   = "Cluster API to node 9443/tcp webhook"
       protocol                      = "tcp"
@@ -200,7 +239,7 @@ module "fargate_profile" {
   create = try(each.value.create, true)
 
   # Fargate Profile
-  cluster_name      = aws_eks_cluster.this[0].name
+  cluster_name      = time_sleep.this[0].triggers["cluster_name"]
   cluster_ip_family = var.cluster_ip_family
   name              = try(each.value.name, each.key)
   subnet_ids        = try(each.value.subnet_ids, var.fargate_profile_defaults.subnet_ids, var.subnet_ids)
@@ -235,8 +274,8 @@ module "eks_managed_node_group" {
 
   create = try(each.value.create, true)
 
-  cluster_name      = aws_eks_cluster.this[0].name
-  cluster_version   = try(each.value.cluster_version, var.eks_managed_node_group_defaults.cluster_version, aws_eks_cluster.this[0].version)
+  cluster_name      = time_sleep.this[0].triggers["cluster_name"]
+  cluster_version   = try(each.value.cluster_version, var.eks_managed_node_group_defaults.cluster_version, time_sleep.this[0].triggers["cluster_version"])
   cluster_ip_family = var.cluster_ip_family
 
   # EKS Managed Node Group
@@ -266,8 +305,8 @@ module "eks_managed_node_group" {
 
   # User data
   platform                   = try(each.value.platform, var.eks_managed_node_group_defaults.platform, "linux")
-  cluster_endpoint           = try(aws_eks_cluster.this[0].endpoint, "")
-  cluster_auth_base64        = try(aws_eks_cluster.this[0].certificate_authority[0].data, "")
+  cluster_endpoint           = try(time_sleep.this[0].triggers["cluster_endpoint"], "")
+  cluster_auth_base64        = try(time_sleep.this[0].triggers["cluster_certificate_authority_data"], "")
   cluster_service_ipv4_cidr  = var.cluster_service_ipv4_cidr
   enable_bootstrap_user_data = try(each.value.enable_bootstrap_user_data, var.eks_managed_node_group_defaults.enable_bootstrap_user_data, false)
   pre_bootstrap_user_data    = try(each.value.pre_bootstrap_user_data, var.eks_managed_node_group_defaults.pre_bootstrap_user_data, "")
@@ -286,6 +325,7 @@ module "eks_managed_node_group" {
   update_launch_template_default_version = try(each.value.update_launch_template_default_version, var.eks_managed_node_group_defaults.update_launch_template_default_version, true)
   launch_template_description            = try(each.value.launch_template_description, var.eks_managed_node_group_defaults.launch_template_description, "Custom launch template for ${try(each.value.name, each.key)} EKS managed node group")
   launch_template_tags                   = try(each.value.launch_template_tags, var.eks_managed_node_group_defaults.launch_template_tags, {})
+  tag_specifications                     = try(each.value.tag_specifications, var.eks_managed_node_group_defaults.tag_specifications, ["instance", "volume", "network-interface"])
 
   ebs_optimized           = try(each.value.ebs_optimized, var.eks_managed_node_group_defaults.ebs_optimized, null)
   key_name                = try(each.value.key_name, var.eks_managed_node_group_defaults.key_name, null)
@@ -323,6 +363,9 @@ module "eks_managed_node_group" {
   # https://github.com/hashicorp/terraform/issues/31646#issuecomment-1217279031
   iam_role_additional_policies = lookup(each.value, "iam_role_additional_policies", lookup(var.eks_managed_node_group_defaults, "iam_role_additional_policies", {}))
 
+  create_schedule = try(each.value.create_schedule, var.eks_managed_node_group_defaults.create_schedule, true)
+  schedules       = try(each.value.schedules, var.eks_managed_node_group_defaults.schedules, {})
+
   # Security group
   vpc_security_group_ids            = compact(concat([local.node_security_group_id], try(each.value.vpc_security_group_ids, var.eks_managed_node_group_defaults.vpc_security_group_ids, [])))
   cluster_primary_security_group_id = try(each.value.attach_cluster_primary_security_group, var.eks_managed_node_group_defaults.attach_cluster_primary_security_group, false) ? aws_eks_cluster.this[0].vpc_config[0].cluster_security_group_id : null
@@ -341,7 +384,7 @@ module "self_managed_node_group" {
 
   create = try(each.value.create, true)
 
-  cluster_name      = aws_eks_cluster.this[0].name
+  cluster_name      = time_sleep.this[0].triggers["cluster_name"]
   cluster_ip_family = var.cluster_ip_family
 
   # Autoscaling Group
@@ -386,7 +429,7 @@ module "self_managed_node_group" {
   mixed_instances_policy     = try(each.value.mixed_instances_policy, var.self_managed_node_group_defaults.mixed_instances_policy, null)
   warm_pool                  = try(each.value.warm_pool, var.self_managed_node_group_defaults.warm_pool, {})
 
-  create_schedule = try(each.value.create_schedule, var.self_managed_node_group_defaults.create_schedule, false)
+  create_schedule = try(each.value.create_schedule, var.self_managed_node_group_defaults.create_schedule, true)
   schedules       = try(each.value.schedules, var.self_managed_node_group_defaults.schedules, {})
 
   delete_timeout         = try(each.value.delete_timeout, var.self_managed_node_group_defaults.delete_timeout, null)
@@ -394,8 +437,8 @@ module "self_managed_node_group" {
 
   # User data
   platform                 = try(each.value.platform, var.self_managed_node_group_defaults.platform, "linux")
-  cluster_endpoint         = try(aws_eks_cluster.this[0].endpoint, "")
-  cluster_auth_base64      = try(aws_eks_cluster.this[0].certificate_authority[0].data, "")
+  cluster_endpoint         = try(time_sleep.this[0].triggers["cluster_endpoint"], "")
+  cluster_auth_base64      = try(time_sleep.this[0].triggers["cluster_certificate_authority_data"], "")
   pre_bootstrap_user_data  = try(each.value.pre_bootstrap_user_data, var.self_managed_node_group_defaults.pre_bootstrap_user_data, "")
   post_bootstrap_user_data = try(each.value.post_bootstrap_user_data, var.self_managed_node_group_defaults.post_bootstrap_user_data, "")
   bootstrap_extra_args     = try(each.value.bootstrap_extra_args, var.self_managed_node_group_defaults.bootstrap_extra_args, "")
@@ -411,10 +454,11 @@ module "self_managed_node_group" {
   update_launch_template_default_version = try(each.value.update_launch_template_default_version, var.self_managed_node_group_defaults.update_launch_template_default_version, true)
   launch_template_description            = try(each.value.launch_template_description, var.self_managed_node_group_defaults.launch_template_description, "Custom launch template for ${try(each.value.name, each.key)} self managed node group")
   launch_template_tags                   = try(each.value.launch_template_tags, var.self_managed_node_group_defaults.launch_template_tags, {})
+  tag_specifications                     = try(each.value.tag_specifications, var.self_managed_node_group_defaults.tag_specifications, ["instance", "volume", "network-interface"])
 
   ebs_optimized   = try(each.value.ebs_optimized, var.self_managed_node_group_defaults.ebs_optimized, null)
   ami_id          = try(each.value.ami_id, var.self_managed_node_group_defaults.ami_id, "")
-  cluster_version = try(each.value.cluster_version, var.self_managed_node_group_defaults.cluster_version, aws_eks_cluster.this[0].version)
+  cluster_version = try(each.value.cluster_version, var.self_managed_node_group_defaults.cluster_version, time_sleep.this[0].triggers["cluster_version"])
   instance_type   = try(each.value.instance_type, var.self_managed_node_group_defaults.instance_type, "m6i.large")
   key_name        = try(each.value.key_name, var.self_managed_node_group_defaults.key_name, null)
 

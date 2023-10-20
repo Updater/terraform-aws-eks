@@ -1,10 +1,15 @@
 # Frequently Asked Questions
 
+- [Setting `disk_size` or `remote_access` does not make any changes](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/faq.md#Settings-disk_size-or-remote_access-does-not-make-any-changes)
 - [I received an error: `expect exactly one securityGroup tagged with kubernetes.io/cluster/<NAME> ...`](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/faq.md#i-received-an-error-expect-exactly-one-securitygroup-tagged-with-kubernetesioclustername-)
 - [Why are nodes not being registered?](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/faq.md#why-are-nodes-not-being-registered)
 - [Why are there no changes when a node group's `desired_size` is modified?](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/faq.md#why-are-there-no-changes-when-a-node-groups-desired_size-is-modified)
 - [How can I deploy Windows based nodes?](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/faq.md#how-can-i-deploy-windows-based-nodes)
 - [How do I access compute resource attributes?](https://github.com/terraform-aws-modules/terraform-aws-eks/blob/master/docs/faq.md#how-do-i-access-compute-resource-attributes)
+
+### Setting `disk_size` or `remote_access` does not make any changes
+
+`disk_size`, and `remote_access` can only be set when using the EKS managed node group default launch template. This module defaults to providing a custom launch template to allow for custom security groups, tag propagation, etc. If you wish to forgo the custom launch template route, you can set `use_custom_launch_template = false` and then you can set `disk_size` and `remote_access`.
 
 ### I received an error: `expect exactly one securityGroup tagged with kubernetes.io/cluster/<NAME> ...`
 
@@ -19,33 +24,15 @@ By default, EKS creates a cluster primary security group that is created outside
   attach_cluster_primary_security_group = true # default is false
 ```
 
-2. If you want to use the cluster primary security group, you can disable the tag passed to the node security group by overriding the tag expected value like:
-
-```hcl
-  attach_cluster_primary_security_group = true # default is false
-
-  node_security_group_tags = {
-    "kubernetes.io/cluster/<CLUSTER_NAME>" = null # or any other value other than "owned"
-  }
-```
-
-3. By overriding the tag expected value on the cluster primary security group like:
-
-```hcl
-  attach_cluster_primary_security_group = true # default is false
-
-  cluster_tags = {
-    "kubernetes.io/cluster/<CLUSTER_NAME>" = null # or any other value other than "owned"
-  }
-```
-
-4. By not attaching the cluster primary security group. The cluster primary security group has quite broad access and the module has instead provided a security group with the minimum amount of access to launch an empty EKS cluster successfully and users are encouraged to open up access when necessary to support their workload.
+2. By not attaching the cluster primary security group. The cluster primary security group has quite broad access and the module has instead provided a security group with the minimum amount of access to launch an empty EKS cluster successfully and users are encouraged to open up access when necessary to support their workload.
 
 ```hcl
   attach_cluster_primary_security_group = false # this is the default for the module
 ```
 
 In theory, if you are attaching the cluster primary security group, you shouldn't need to use the shared node security group created by the module. However, this is left up to users to decide for their requirements and use case.
+
+If you choose to use [Custom Networking](https://docs.aws.amazon.com/eks/latest/userguide/cni-custom-network.html), make sure to only attach the security groups matching your choice above in your ENIConfig resources. This will ensure you avoid redundant tags.
 
 ### Why are nodes not being registered?
 

@@ -32,6 +32,12 @@ variable "irsa_name" {
   default     = null
 }
 
+variable "irsa_policy_name" {
+  description = "Name of IAM policy for service accounts"
+  type        = string
+  default     = null
+}
+
 variable "irsa_use_name_prefix" {
   description = "Determines whether the IAM role for service accounts name (`irsa_name`) is used as a prefix"
   type        = bool
@@ -68,10 +74,22 @@ variable "irsa_tags" {
   default     = {}
 }
 
+variable "policies" {
+  description = "Policies to attach to the IAM role in `{'static_name' = 'policy_arn'}` format"
+  type        = map(string)
+  default     = {}
+}
+
 variable "irsa_tag_key" {
   description = "Tag key (`{key = value}`) applied to resources launched by Karpenter through the Karpenter provisioner"
   type        = string
   default     = "karpenter.sh/discovery"
+}
+
+variable "irsa_tag_values" {
+  description = "Tag values (`{key = value}`) applied to resources launched by Karpenter through the Karpenter provisioner. Defaults to cluster name when not set."
+  type        = list(string)
+  default     = []
 }
 
 variable "irsa_ssm_parameter_arns" {
@@ -205,8 +223,8 @@ variable "iam_role_attach_cni_policy" {
 
 variable "iam_role_additional_policies" {
   description = "Additional policies to be added to the IAM role"
-  type        = list(string)
-  default     = []
+  type        = map(string)
+  default     = {}
 }
 
 variable "iam_role_tags" {
@@ -223,4 +241,14 @@ variable "create_instance_profile" {
   description = "Whether to create an IAM instance profile"
   type        = bool
   default     = true
+}
+
+################################################################################
+# Event Bridge Rules
+################################################################################
+
+variable "rule_name_prefix" {
+  description = "Prefix used for all event bridge rules"
+  type        = string
+  default     = "Karpenter"
 }

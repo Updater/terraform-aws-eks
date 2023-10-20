@@ -54,7 +54,7 @@ data "aws_ecrpublic_authorization_token" "token" {
 
 locals {
   name            = "ex-${replace(basename(path.cwd), "_", "-")}"
-  cluster_version = "1.24"
+  cluster_version = "1.27"
   region          = "eu-west-1"
 
   vpc_cidr = "10.0.0.0/16"
@@ -78,9 +78,43 @@ module "eks" {
   cluster_version                = local.cluster_version
   cluster_endpoint_public_access = true
 
+  cluster_addons = {
+    kube-proxy = {}
+    vpc-cni    = {}
+    coredns = {
+      configuration_values = jsonencode({
+        computeType = "Fargate"
+        # Ensure that we fully utilize the minimum amount of resources that are supplied by
+        # Fargate https://docs.aws.amazon.com/eks/latest/userguide/fargate-pod-configuration.html
+        # Fargate adds 256 MB to each pod's memory reservation for the required Kubernetes
+        # components (kubelet, kube-proxy, and containerd). Fargate rounds up to the following
+        # compute configuration that most closely matches the sum of vCPU and memory requests in
+        # order to ensure pods always have the resources that they need to run.
+        resources = {
+          limits = {
+            cpu = "0.25"
+            # We are targeting the smallest Task size of 512Mb, so we subtract 256Mb from the
+            # request/limit to ensure we can fit within that task
+            memory = "256M"
+          }
+          requests = {
+            cpu = "0.25"
+            # We are targeting the smallest Task size of 512Mb, so we subtract 256Mb from the
+            # request/limit to ensure we can fit within that task
+            memory = "256M"
+          }
+        }
+      })
+    }
+  }
+
   vpc_id                   = module.vpc.vpc_id
   subnet_ids               = module.vpc.private_subnets
   control_plane_subnet_ids = module.vpc.intra_subnets
+
+  # Fargate profiles use the cluster primary security group so these are not utilized
+  create_cluster_security_group = false
+  create_node_security_group    = false
 
   manage_aws_auth_configmap = true
   aws_auth_roles = [
@@ -96,17 +130,14 @@ module "eks" {
   ]
 
   fargate_profiles = {
-    kube_system = {
-      name = "kube-system"
-      selectors = [
-        { namespace = "kube-system" }
-      ]
-    }
-
     karpenter = {
-      name = "karpenter"
       selectors = [
         { namespace = "karpenter" }
+      ]
+    }
+    kube-system = {
+      selectors = [
+        { namespace = "kube-system" }
       ]
     }
   }
@@ -129,6 +160,16 @@ module "karpenter" {
   cluster_name           = module.eks.cluster_name
   irsa_oidc_provider_arn = module.eks.oidc_provider_arn
 
+  # Used to attach additional IAM policies to the Karpenter controller IRSA role
+  # policies = {
+  #   "xxx" = "yyy"
+  # }
+
+  # Used to attach additional IAM policies to the Karpenter node IAM role
+  iam_role_additional_policies = {
+    AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  }
+
   tags = local.tags
 }
 
@@ -141,7 +182,7 @@ resource "helm_release" "karpenter" {
   repository_username = data.aws_ecrpublic_authorization_token.token.user_name
   repository_password = data.aws_ecrpublic_authorization_token.token.password
   chart               = "karpenter"
-  version             = "v0.19.3"
+  version             = "v0.29.0"
 
   set {
     name  = "settings.aws.clusterName"
@@ -246,135 +287,12 @@ resource "kubectl_manifest" "karpenter_example_deployment" {
 }
 
 ################################################################################
-# Modify EKS CoreDNS Deployment
-################################################################################
-
-data "aws_eks_cluster_auth" "this" {
-  name = module.eks.cluster_name
-}
-
-locals {
-  kubeconfig = yamlencode({
-    apiVersion      = "v1"
-    kind            = "Config"
-    current-context = "terraform"
-    clusters = [{
-      name = module.eks.cluster_name
-      cluster = {
-        certificate-authority-data = module.eks.cluster_certificate_authority_data
-        server                     = module.eks.cluster_endpoint
-      }
-    }]
-    contexts = [{
-      name = "terraform"
-      context = {
-        cluster = module.eks.cluster_name
-        user    = "terraform"
-      }
-    }]
-    users = [{
-      name = "terraform"
-      user = {
-        token = data.aws_eks_cluster_auth.this.token
-      }
-    }]
-  })
-}
-
-# Separate resource so that this is only ever executed once
-resource "null_resource" "remove_default_coredns_deployment" {
-  triggers = {}
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    environment = {
-      KUBECONFIG = base64encode(local.kubeconfig)
-    }
-
-    # We are removing the deployment provided by the EKS service and replacing it through the self-managed CoreDNS Helm addon
-    # However, we are maintaining the existing kube-dns service and annotating it for Helm to assume control
-    command = <<-EOT
-      kubectl --namespace kube-system delete deployment coredns --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-    EOT
-  }
-}
-
-resource "null_resource" "modify_kube_dns" {
-  triggers = {}
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    environment = {
-      KUBECONFIG = base64encode(local.kubeconfig)
-    }
-
-    # We are maintaining the existing kube-dns service and annotating it for Helm to assume control
-    command = <<-EOT
-      echo "Setting implicit dependency on ${module.eks.fargate_profiles["kube_system"].fargate_profile_pod_execution_role_arn}"
-      kubectl --namespace kube-system annotate --overwrite service kube-dns meta.helm.sh/release-name=coredns --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-      kubectl --namespace kube-system annotate --overwrite service kube-dns meta.helm.sh/release-namespace=kube-system --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-      kubectl --namespace kube-system label --overwrite service kube-dns app.kubernetes.io/managed-by=Helm --kubeconfig <(echo $KUBECONFIG | base64 --decode)
-    EOT
-  }
-
-  depends_on = [
-    null_resource.remove_default_coredns_deployment
-  ]
-}
-
-################################################################################
-# CoreDNS Helm Chart (self-managed)
-################################################################################
-
-data "aws_eks_addon_version" "this" {
-  for_each = toset(["coredns"])
-
-  addon_name         = each.value
-  kubernetes_version = module.eks.cluster_version
-  most_recent        = true
-}
-
-resource "helm_release" "coredns" {
-  name             = "coredns"
-  namespace        = "kube-system"
-  create_namespace = false
-  description      = "CoreDNS is a DNS server that chains plugins and provides Kubernetes DNS Services"
-  chart            = "coredns"
-  version          = "1.19.4"
-  repository       = "https://coredns.github.io/helm"
-
-  # For EKS image repositories https://docs.aws.amazon.com/eks/latest/userguide/add-ons-images.html
-  values = [
-    <<-EOT
-      image:
-        repository: 602401143452.dkr.ecr.eu-west-1.amazonaws.com/eks/coredns
-        tag: ${data.aws_eks_addon_version.this["coredns"].version}
-      deployment:
-        name: coredns
-        annotations:
-          eks.amazonaws.com/compute-type: fargate
-      service:
-        name: kube-dns
-        annotations:
-          eks.amazonaws.com/compute-type: fargate
-      podAnnotations:
-        eks.amazonaws.com/compute-type: fargate
-      EOT
-  ]
-
-  depends_on = [
-    # Need to ensure the CoreDNS updates are performed before provisioning
-    null_resource.modify_kube_dns
-  ]
-}
-
-################################################################################
 # Supporting Resources
 ################################################################################
 
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 3.0"
+  version = "~> 4.0"
 
   name = local.name
   cidr = local.vpc_cidr
@@ -384,13 +302,8 @@ module "vpc" {
   public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 48)]
   intra_subnets   = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 52)]
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true
-  enable_dns_hostnames = true
-
-  enable_flow_log                      = true
-  create_flow_log_cloudwatch_iam_role  = true
-  create_flow_log_cloudwatch_log_group = true
+  enable_nat_gateway = true
+  single_nat_gateway = true
 
   public_subnet_tags = {
     "kubernetes.io/role/elb" = 1

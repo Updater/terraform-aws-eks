@@ -274,6 +274,12 @@ variable "launch_template_tags" {
   default     = {}
 }
 
+variable "tag_specifications" {
+  description = "The tags to apply to the resources during launch"
+  type        = list(string)
+  default     = ["instance", "volume", "network-interface"]
+}
+
 ################################################################################
 # EKS Managed Node Group
 ################################################################################
@@ -461,5 +467,21 @@ variable "iam_role_additional_policies" {
 variable "iam_role_tags" {
   description = "A map of additional tags to add to the IAM role created"
   type        = map(string)
+  default     = {}
+}
+
+################################################################################
+# Autoscaling Group Schedule
+################################################################################
+
+variable "create_schedule" {
+  description = "Determines whether to create autoscaling group schedule or not"
+  type        = bool
+  default     = true
+}
+
+variable "schedules" {
+  description = "Map of autoscaling group schedule to create"
+  type        = map(any)
   default     = {}
 }

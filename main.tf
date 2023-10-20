@@ -1,6 +1,14 @@
 data "aws_partition" "current" {}
 data "aws_caller_identity" "current" {}
 
+data "aws_iam_session_context" "current" {
+  # This data source provides information on the IAM source role of an STS assumed role
+  # For non-role ARNs, this data source simply passes the ARN through issuer ARN
+  # Ref https://github.com/terraform-aws-modules/terraform-aws-eks/issues/2327#issuecomment-1355581682
+  # Ref https://github.com/hashicorp/terraform-provider-aws/issues/28381
+  arn = data.aws_caller_identity.current.arn
+}
+
 locals {
   create = var.create && var.putin_khuylo
 
@@ -77,7 +85,8 @@ resource "aws_eks_cluster" "this" {
     aws_iam_role_policy_attachment.this,
     aws_security_group_rule.cluster,
     aws_security_group_rule.node,
-    aws_cloudwatch_log_group.this
+    aws_cloudwatch_log_group.this,
+    aws_iam_policy.cni_ipv6_policy,
   ]
 }
 
@@ -101,7 +110,10 @@ resource "aws_cloudwatch_log_group" "this" {
   retention_in_days = var.cloudwatch_log_group_retention_in_days
   kms_key_id        = var.cloudwatch_log_group_kms_key_id
 
-  tags = var.tags
+  tags = merge(
+    var.tags,
+    { Name = "/aws/eks/${var.cluster_name}/cluster" }
+  )
 }
 
 ################################################################################
@@ -122,7 +134,7 @@ module "kms" {
   # Policy
   enable_default_policy     = var.kms_key_enable_default_policy
   key_owners                = var.kms_key_owners
-  key_administrators        = coalescelist(var.kms_key_administrators, [data.aws_caller_identity.current.arn])
+  key_administrators        = coalescelist(var.kms_key_administrators, [data.aws_iam_session_context.current.issuer_arn])
   key_users                 = concat([local.cluster_role], var.kms_key_users)
   key_service_users         = var.kms_key_service_users
   source_policy_documents   = var.kms_key_source_policy_documents
@@ -220,7 +232,7 @@ resource "aws_iam_openid_connect_provider" "oidc_provider" {
   count = local.create && var.enable_irsa && !local.create_outposts_local_cluster ? 1 : 0
 
   client_id_list  = distinct(compact(concat(["sts.${local.dns_suffix}"], var.openid_connect_audiences)))
-  thumbprint_list = concat(data.tls_certificate.this[0].certificates[*].sha1_fingerprint, var.custom_oidc_thumbprints)
+  thumbprint_list = concat([data.tls_certificate.this[0].certificates[0].sha1_fingerprint], var.custom_oidc_thumbprints)
   url             = aws_eks_cluster.this[0].identity[0].oidc[0].issuer
 
   tags = merge(
@@ -369,12 +381,13 @@ resource "aws_iam_policy" "cluster_encryption" {
 
 resource "aws_eks_addon" "this" {
   # Not supported on outposts
-  for_each = { for k, v in var.cluster_addons : k => v if local.create && !local.create_outposts_local_cluster }
+  for_each = { for k, v in var.cluster_addons : k => v if !try(v.before_compute, false) && local.create && !local.create_outposts_local_cluster }
 
   cluster_name = aws_eks_cluster.this[0].name
   addon_name   = try(each.value.name, each.key)
 
-  addon_version            = try(each.value.addon_version, data.aws_eks_addon_version.this[each.key].version)
+  addon_version            = coalesce(try(each.value.addon_version, null), data.aws_eks_addon_version.this[each.key].version)
+  configuration_values     = try(each.value.configuration_values, null)
   preserve                 = try(each.value.preserve, null)
   resolve_conflicts        = try(each.value.resolve_conflicts, "OVERWRITE")
   service_account_role_arn = try(each.value.service_account_role_arn, null)
@@ -390,6 +403,28 @@ resource "aws_eks_addon" "this" {
     module.eks_managed_node_group,
     module.self_managed_node_group,
   ]
+
+  tags = var.tags
+}
+
+resource "aws_eks_addon" "before_compute" {
+  # Not supported on outposts
+  for_each = { for k, v in var.cluster_addons : k => v if try(v.before_compute, false) && local.create && !local.create_outposts_local_cluster }
+
+  cluster_name = aws_eks_cluster.this[0].name
+  addon_name   = try(each.value.name, each.key)
+
+  addon_version            = coalesce(try(each.value.addon_version, null), data.aws_eks_addon_version.this[each.key].version)
+  configuration_values     = try(each.value.configuration_values, null)
+  preserve                 = try(each.value.preserve, null)
+  resolve_conflicts        = try(each.value.resolve_conflicts, "OVERWRITE")
+  service_account_role_arn = try(each.value.service_account_role_arn, null)
+
+  timeouts {
+    create = try(each.value.timeouts.create, var.cluster_addons_timeouts.create, null)
+    update = try(each.value.timeouts.update, var.cluster_addons_timeouts.update, null)
+    delete = try(each.value.timeouts.delete, var.cluster_addons_timeouts.delete, null)
+  }
 
   tags = var.tags
 }
@@ -434,7 +469,7 @@ locals {
   node_iam_role_arns_non_windows = distinct(
     compact(
       concat(
-        [for group in module.eks_managed_node_group : group.iam_role_arn],
+        [for group in module.eks_managed_node_group : group.iam_role_arn if group.platform != "windows"],
         [for group in module.self_managed_node_group : group.iam_role_arn if group.platform != "windows"],
         var.aws_auth_node_iam_role_arns_non_windows,
       )
@@ -444,6 +479,7 @@ locals {
   node_iam_role_arns_windows = distinct(
     compact(
       concat(
+        [for group in module.eks_managed_node_group : group.iam_role_arn if group.platform == "windows"],
         [for group in module.self_managed_node_group : group.iam_role_arn if group.platform == "windows"],
         var.aws_auth_node_iam_role_arns_windows,
       )
@@ -511,7 +547,7 @@ resource "kubernetes_config_map" "aws_auth" {
   lifecycle {
     # We are ignoring the data here since we will manage it with the resource below
     # This is only intended to be used in scenarios where the configmap does not exist
-    ignore_changes = [data]
+    ignore_changes = [data, metadata[0].labels, metadata[0].annotations]
   }
 }
 

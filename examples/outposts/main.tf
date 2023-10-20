@@ -16,7 +16,7 @@ provider "kubernetes" {
 
 locals {
   name            = "ex-${basename(path.cwd)}"
-  cluster_version = "1.21" # Required by EKS on Outposts
+  cluster_version = "1.27" # Required by EKS on Outposts
 
   outpost_arn   = element(tolist(data.aws_outposts_outposts.this.arns), 0)
   instance_type = element(tolist(data.aws_outposts_outpost_instance_types.this.instance_types), 0)
@@ -61,14 +61,6 @@ module "eks" {
       to_port     = 443
       type        = "ingress"
       cidr_blocks = [data.aws_vpc.this.cidr_block]
-    }
-  }
-
-  self_managed_node_group_defaults = {
-    attach_cluster_primary_security_group = true
-
-    iam_role_additional_policies = {
-      AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
     }
   }
 
